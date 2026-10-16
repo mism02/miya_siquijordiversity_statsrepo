@@ -1,0 +1,290 @@
+---
+title: "richness comparisons"
+format: html
+editor: visual
+---
+
+# Load library and clear environment option
+
+```{r}
+library(dplyr)
+library(stringr)
+library(glmmTMB)
+library(emmeans)
+library(tidyverse) # data manipulation
+library(broom.mixed) # for tidy model interpretation
+library(emmeans) # estimating marginal means
+library(DHARMa) # model diagnostics
+library(glmmTMB) # running glmms
+library(ggimage) # for adding images
+library(patchwork) # for combining plots
+
+rm(list = ls())
+```
+
+# Read data
+
+```{r}
+siq_data <- read_csv("~/Documents/MSI - GRAD SCHOOL/Siquijor Paper/McGlone_Siquijor Data/miya_siquijordiversity_statsrepo/Data/Siquijor_RData.csv", trim_ws = TRUE)
+```
+
+# Unique and total species analysis - pooled per habitat type only, not location
+
+```{r}
+species_by_habitat <- siq_data %>%
+  mutate(habitat = str_trim(habitat),
+         scientific_name = str_trim(scientific_name)) %>%
+  filter(!is.na(scientific_name), scientific_name != "") %>%
+  distinct(habitat, scientific_name)
+
+unique_counts <- species_by_habitat %>%
+  add_count(scientific_name, name = "habitat_count") %>%
+  group_by(habitat) %>%
+  summarise(
+    species_recorded = n_distinct(scientific_name),
+    unique_species = n_distinct(scientific_name[habitat_count == 1]),
+    .groups = "drop"
+  ) %>%
+  mutate(percent_unique = 100 * unique_species / species_recorded)
+
+unique_counts %>% as_tibble()
+```
+
+# Unique and total species analysis - per location per habitat
+
+```{r}
+species_by_habitat2 <- siq_data %>%
+  mutate(
+    habitat = str_trim(habitat),
+    scientific_name = str_trim(scientific_name)
+  ) %>%
+  filter(!is.na(scientific_name), scientific_name != "") %>%
+  distinct(location_name, habitat, scientific_name)
+
+unique_counts2 <- species_by_habitat2 %>%
+  add_count(location_name, scientific_name, name = "location_count") %>%
+  group_by(location_name, habitat) %>%
+  summarise(
+    species_recorded = n_distinct(scientific_name),
+    unique_species = n_distinct(scientific_name[location_count == 1]),
+    .groups = "drop"
+  ) %>%
+  mutate(percent_unique = 100 * unique_species / species_recorded)
+
+unique_counts2  %>% as_tibble()
+#overall richness per habitat per location type
+```
+
+## fix data to run a glmm comparing species richness per habitat type per location
+
+```{r}
+siq_data_glmm <- siq_data %>%
+  mutate(
+    habitat = str_trim(habitat),
+    scientific_name = str_trim(scientific_name),
+    location_name = factor(location_name),
+    habitat = factor(habitat),
+    samp_code = factor(samp_code)
+  ) %>%
+  filter(!is.na(scientific_name), scientific_name != "")
+
+# get species richness per samp_id
+richness_data <- siq_data_glmm %>%
+  group_by(samp_id, samp_code, location_name, habitat) %>%
+  summarise(
+    species_richness = n_distinct(scientific_name),
+    .groups = "drop"
+  )
+#apparently you shouldn't pool transect data, so using samp_id data parin
+
+```
+
+# model fitting for species richness diffs per location_habitat
+
+```{r}
+# fit model neg binomial, habitat and location effects, including their interaction
+richness_nbinom2_mod <- 
+  glmmTMB(species_richness ~ habitat * location_name 
+          + (1 | samp_code), # listing samp_code as a random effect because we looked at diffs in sp. per transect
+  family = nbinom2(),
+  data = richness_data)
+
+#model validation
+richness_nbinom2_mod %>% testUniformity()
+richness_nbinom2_mod %>% plotResiduals() 
+richness_nbinom2_mod %>% testDispersion()
+
+#double check residuals test
+sim_nbinom2_mod <- simulateResiduals(
+  fittedModel = richness_nbinom2_mod,
+  n = 1000
+)
+
+plot(sim_nbinom2_mod)
+testDispersion(sim_nbinom2_mod)
+testZeroInflation(sim_nbinom2_mod)
+testUniformity(sim_nbinom2_mod)
+
+```
+
+# Save / load model
+
+```{r}
+save(richness_nbinom2_mod, file = "Model_output/richness_nbinom2_mod.RData")
+
+load("Model_output/richness_nbinom2_mod.RData")
+```
+
+# emmeans and pairwise comparisons
+
+```{r}
+# Compare habitats within each location
+pairwise_richness_habitat <- 
+  richness_nbinom2_mod %>%
+  emmeans(~ habitat | location_name) %>%
+  pairs(type = "response") %>%
+  summary(infer = c(TRUE, TRUE), level = 0.95) %>%
+  mutate(p.value = round(p.value, 3)) %>%
+  as_tibble()
+
+pairwise_richness_location <- 
+  richness_nbinom2_mod %>%
+  emmeans(~ location_name | habitat) %>%
+  pairs(type = "response") %>%
+  summary(infer = c(TRUE, TRUE), level = 0.95) %>%
+  mutate(p.value = round(p.value, 3)) %>%
+  as_tibble()
+#mukhang no differences in richness in a habitat type regardless of location
+
+```
+
+## Predictions for plotting
+
+```{r}
+# predicitions and emmeans used for plotting (the predictions, not actual raw data)
+pairwise_richness_habitat <- 
+  richness_nbinom2_mod %>%
+  emmeans(~ habitat | location_name) %>%
+  pairs(type = "response") %>%
+  summary(infer = c(TRUE, TRUE), level = 0.95) %>%
+  mutate(p.value = round(p.value, 3)) %>%
+  as_tibble()
+
+pairwise_richness_habitat_newdata <-
+    richness_nbinom2_mod %>%
+  emmeans(~ habitat | location_name, #have 2 factors now so use ~
+          type = "response") %>% #log scale to response scale
+  as_tibble()
+```
+
+## Plot - species richness per habitat type per location
+
+```{r}
+#convert labels for habitats and order first
+habitat_levels <- c(
+  "Seagrass_bed_enhalus",
+  "Seagrass_bed_thalassia",
+  "Algal_bed_sargassum",
+  "Reef_crest",
+  "Upper_shallow_reef",
+  "Lower_shallow_reef",
+  "Upper_mesophotic_reef",
+  "Lower_mesophotic_reef"
+)
+
+habitat_labels <- c(
+  "Seagrass Bed (Enhalus)",
+  "Seagrass Bed (Thalassia)",
+  "Algal Bed (Sargassum)",
+  "Reef Crest",
+  "Upper Shallow Reef",
+  "Lower Shallow Reef",
+  "Upper Mesophotic Reef",
+  "Lower Mesophotic Reef"
+)
+
+pairwise_richness_habitat_newdata <- pairwise_richness_habitat_newdata %>%
+  mutate(
+    habitat = factor(
+      trimws(habitat),
+      levels = habitat_levels,
+      labels = habitat_labels
+    )
+  )
+
+#plot - model
+p_richness <-
+  pairwise_richness_habitat_newdata %>%
+  ggplot(aes(y = response,
+             x = habitat,
+             fill = location_name,
+             color = location_name)) +
+  scale_color_manual(values = c(
+    "North" = "#F02522",
+    "South" = "#F0D622"
+  )) +
+  scale_fill_manual(values = c(
+    "North" = "#F02522",
+    "South" = "#F0D622"
+  )) +
+  geom_pointrange(aes(ymin = asymp.LCL, ymax = asymp.UCL),
+                  position = position_dodge(0.5)) +
+  facet_wrap(~ location_name,
+            ncol = 1,
+            scales = "free_x",
+            labeller = labeller(location_name = 
+                                  c("North" = "North", "South" = "South"))
+            ) +
+  scale_x_discrete(name = "Habitat Type",
+                   guide = guide_axis(n.dodge = 2)) +
+  scale_y_continuous(name = "# Species",
+                     limits = c(0, 35),
+                     breaks = seq(0, 35, by = 5)) +
+  theme_classic() +
+  ggtitle("Species Richness") +
+  theme(legend.position = "none",
+        strip.background = element_blank(), 
+        strip.text = element_text(size = 12)
+        )
+
+p_richness
+```
+
+## Model interpretation
+
+```{r}
+richness_nbinom2_mod %>% broom.mixed::tidy(
+  effects = "fixed",
+  conf.int = TRUE,
+  exponentiate = TRUE) %>%
+  mutate(p.value = round(p.value, 2))
+
+###DOUBLE CHECK...DIDN'T REALLY USE THIS PA
+
+```
+
+### Pairwise between habitat types per location
+
+```{r}
+pairwise_richness_habitat <- 
+  richness_nbinom2_mod %>%
+  emmeans(~ habitat | location_name) %>%
+  pairs(type = "response") %>%
+  summary(infer = c(TRUE, TRUE), level = 0.95) %>%
+  mutate(p.value = round(p.value, 3)) %>%
+  as_tibble()
+
+pairwise_richness_habitat
+```
+
+# Save plot
+
+```{r}
+ggsave("Figures/p_richness.jpeg",
+       plot = p_richness,
+       dpi = 300,
+       height = 8,
+       width = 12,
+       units = "in")
+
+```
